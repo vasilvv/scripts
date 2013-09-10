@@ -1,196 +1,92 @@
-#!/bin/bash
+#!/usr/bin/python
 
-# Usage: dasource [-r REPOS] [PACKAGENAME ...]
+import debian.changelog
+import os
+import sys
+import shutil
+import subprocess
 
-# Creates or updates a checkout and source package for each listed
-# PACKAGENAME, or for all regular packages if no PACKAGENAME is
-# specified.
+def die(message):
+    sys.stderr.write("%s\n" % message)
+    sys.exit(1)
 
-# If REPOS is specified, it is used in preference to the canonical
-# Athena repository trunk.
+def git(*args, **kwargs):
+    global repo_path
 
-# Package subdirectories are created in the cwd.  The source checkout
-# will reside in PACKAGENAME/PACKAGENAME-VERSION and the source
-# package will be created in PACKAGENAME.
+    cmd = ['git'] + list(args)
+    return subprocess.check_output(cmd, stderr = subprocess.STDOUT, cwd = repo_path, **kwargs)
 
-set -e
+# Parse command-line arguments
+if len(sys.argv) < 2:
+    die("Usage: dasource repo")
 
-trap 'echo "dasource failed: Source package _not_ created"' EXIT
+repo_name = sys.argv[1]
+repo_path = "%s/%s" % (os.environ['DEBATHENA_CHECKOUT_HOME'], repo_name)
+if not os.path.isdir(repo_path):
+    die("%s is supposed to be the repository checkout, bit it is not a directory" % repo_path)
 
-die() {
-  echo "$@" >&2
-  exit 1
-}
+# Clean up
+git('clean', '-dfx')
+git('reset', '--hard', 'HEAD')
 
-usage() {
-  die "dasource [-r repos] [packagename ...]"
-}
-: ${DA_SCRIPTS_DIR="$(dirname "$(readlink -f "$0")")"}
-basedir="$DA_SCRIPTS_DIR"
-repo=git+ssh://git.mit.edu
+# Locate master and debian branches
+rev_master = git('rev-parse', 'refs/heads/master')
+try:
+    rev_debian = git('rev-parse', 'refs/heads/debian')
+except subprocess.CalledProcessError:
+    try:
+        rev_debian = git('rev-parse', 'origin/debian')
+    except subprocess.CalledProcessError:
+        rev_debian = None
 
-while getopts r: opt; do
-  case "$opt" in
-  r)
-    repo="$OPTARG"
-    ;;
-  \?)
-    usage
-    ;;
-  esac
-done
-shift $(($OPTIND - 1))
+# Switch to debian branch, if present
+if rev_debian:
+    git('checkout', 'debian')
 
-do_package() {
-  pkgname=$1
-  pkgpath=$2
-  if [ ! -d $pkgname ]; then
-    echo "Creating directory $pkgname"
-    mkdir $pkgname
-  fi
+if not os.path.isfile(repo_path + "/debian/source/format"):
+    die("The repository does not contain source format")
 
-  # Work around a bad interaction between dpkg-source and AFS.
-  # (dpkg-source invokes perl's Tempfile which checks if the parent
-  # directory is writable using mode bits).  This will not actually
-  # grant any outside access to the directory since AFS ignores
-  # non-user mode bits.
-  if fs whichcell . >/dev/null 2>&1; then
-    chmod 777 $pkgname
-  fi
+# Validate source format
+with open(repo_path + "/debian/source/format") as f:
+    source_format = f.read().strip()
+    if rev_debian and source_format != "3.0 (quilt)":
+        die("The repository has debian branch, but format is not 3.0 (quilt).")
+    if not rev_debian and source_format != "3.0 (native)":
+        die("The repository does not have debian branch, but format is not 3.0 (native).")
 
-  # Check out or update the package source.
-  pattern="$pkgname/$pkgname-[0-9]*[0-9]"
-  if [ $(echo $pattern | wc -w) -gt 1 ]; then
-    die "More than one checkout under $pkgname!"
-  elif [ -d $pattern ]; then
-    dir=$(echo $pattern)
-    if [ -d "${dir}/.svn" ]; then
-	echo "Old SVN checkout found.  Killing with fire..."
-	rm -rf "$dir"
-	dir=$pkgname/$pkgname
-	echo "Checking out $repo$pkgpath into $dir"
-	git clone $repo$pkgpath $dir
-    else
-	echo "Updating and cleaning $dir"
-	(cd $dir && git checkout -f && git pull)
-    fi
-  else
-    dir=$pkgname/$pkgname
-    echo "Checking out $repo$pkgpath into $dir"
-    git clone $repo$pkgpath $dir
-  fi
+# Check gbp.conf
+if not os.path.isfile(repo_path + "/debian/gbp.conf"):
+    die("The repository does not contain gbp.conf")
 
-  # Ensure that we're not trying to do something stupid
-  distribution=$(cd $dir && dpkg-parsechangelog | sed -n 's/Distribution: //p')
-  if [ "$distribution" = "UNRELEASED" ]; then
-    echo "You can't/shouldn't build a package marked as UNRELEASED."
-    exit 1
-  fi
+# Load the changelog for package information
+with open(repo_path + '/debian/changelog') as f:
+    changelog_src = f.read()
+    cl = debian.changelog.Changelog(changelog_src)
 
-  # Extract the changelog version and strip off the epoch and Debian component.
-  changever=$(cd $dir && dpkg-parsechangelog | sed -n 's/Version: //p')
-  sver=$(echo $changever | sed -re 's/^[0-9]+://p')
-  upver=$(echo $sver | sed -re 's/-[^-]*$//')
+# List names of all the source package files
+if source_format == "3.0 (quilt)":
+    source_package_files = [ '%s_%s%s' % (cl.package, cl.version, ext) for ext in
+            ('.dsc', '.debian.tar.gz', '_source.build', '_source.changes') ]
+    source_package_files += ['%s_%s.orig.tar.gz' % (cl.package, cl.upstream_version)]
+if source_format == "3.0 (native)":
+    source_package_files = [ '%s_%s%s' % (cl.package, cl.version, ext) for ext in
+            ('.dsc', '_source.build', '_source.changes', '.tar.gz') ]
 
-  # Rename the source checkout if necessary.
-  correctdir=$pkgname/${pkgname}-$upver
-  if [ $dir != $correctdir ]; then
-    echo "Renaming $dir to $correctdir"
-    mv $dir $correctdir
-    dir=$correctdir
-  fi
+# Check if there is already a source package at temporary location
+repo_build_dest = os.path.dirname(repo_path)
+source_packages_repo_base = [ "%s/%s" % (repo_build_dest, pkg) for pkg in source_package_files ]
+if any(os.path.exists(pkg_file) for pkg_file in source_packages_repo_base):
+    die("""There are source package files already present in the checkout directory.
+They should not be there, because they are moved by dasource after build.
+Please find out why they are there and remove them.""")
 
-  # TODO: Sanity-check that the version in configure.ac matches the
-  #       upstream version
 
-  # Add autoconf goo if it's an Athena source directory.
-  # We can no longer determine this from the repo path
-  if [ -e "$dir/configure.in" ] && ! [ -e "$dir/configure.ac" ] \
-      && ! [ -e "$dir/configure" ]; then
-      (cd $dir && $basedir/daconfiscate)
-  fi
+# Build the source package
+try:
+    git('buildpackage', '-S', '-us', '-uc')
+except subprocess.CalledProcessError as err:
+    die(err.output)
 
-  # Generate debian/control from debian/control.in if control.in exists
- [ -f "$dir/debian/control.in" ] && echo "NOTE: Obsolete CDBS package -- convert to DH7!"
-  ([ -f "$dir/debian/control.in" ] && cd $dir && DEB_AUTO_UPDATE_DEBIAN_CONTROL=yes debian/rules debian/control || :)
-  [ -f "$dir/debian/control" ] || die "Can't find or generate debian/control!"
-
-  # Read in debian-versions
-  . $basedir/debian-versions.sh
-
-  NOBUILD=$(grep-dctrl -n -s X-Debathena-No-Build -F X-Debathena-No-Build -e . "$dir/debian/control" || true)
-  BUILDFOR=$(grep-dctrl -n -s X-Debathena-Build-For -F X-Debathena-Build-For -e . "$dir/debian/control" || true)
-  if [ -n "$NOBUILD" ] && [ -n "$BUILDFOR" ]; then
-      echo "It is an error to specify both X-Debathena-Build-For and"
-      echo "X-Debathena-No-Build.  Pick one and try again."
-      die
-  elif [ -z "$NOBUILD" ] && [ -z "$BUILDFOR" ]; then
-      [ -f "$pkgname/nobuild" ] && echo "NOTE: Please migrate legacy ./nobuild to X-Debathena-No-Build!"
-  else
-      [ -f "$pkgname/nobuild" ] && rm "$pkgname/nobuild"
-      if [ -n "$BUILDFOR" ]; then
-	  NOBUILD=
-	  for code in $DEBIAN_CODES; do
-	      if ! echo "$BUILDFOR" | fgrep -q "$code"; then
-		  NOBUILD="$NOBUILD $code"
-	      fi
-	  done
-      fi
-      echo "$NOBUILD" > "$pkgname/nobuild"
-  fi
-
-  # Create a suitable orig tarball if necessary.
-  (cd $dir && $basedir/daorig)
-
-  # Build an unsigned package, ignoring version control subdirs in the source.
-  echo "Creating source package"
-  (cd $dir && debuild -S -i -I.svn -sa -us -uc)
-
-  if grep '^Architecture: ' $dir/debian/control | grep -q -v 'Architecture: all'; then
-    echo "At least one arch-dependent binary package; run sbuildhack WITHOUT -A." >&2
-  elif grep -q '^Architecture: ' $dir/debian/control; then
-    echo "No arch-dependent binary packages; run sbuildhack with -A." >&2
-  else
-    echo "No binary packages???" >&2
-  fi
-}
-
-packages=packages
-
-if [ ! -r "$packages" ]; then
-    packages=/mit/debathena/packages/packages
-fi
-if [ ! -r "$packages" ]; then
-  die "Can't read packages file; create with gen-packages"
-fi
-
-if [ $# -gt 0 ]; then
-  # Build specific source packages.
-  for pkgname; do
-    pkgname="${pkgname%/}"
-    pkgpath=$(sed -nre "s/^$pkgname[[:space:]]+//p" "$packages")
-    if ! [ -n "$pkgpath" ]; then
-	echo "Can't find package $pkgname" >&2
-	echo >&2
-	echo "This may be because the list of packages is not up to date. If" >&2
-	echo "this is a new package, and you have the bits, run gen-packages" >&2
-	echo "with /mit/debathena/packages as your working directory." >&2
-	echo "Otherwise, run gen-packages in this directory and dasource will" >&2
-	echo "use the generated file instead." >&2
-	die
-    fi
-    do_package $pkgname $pkgpath
-  done
-else
-  echo -n "Really build ALL source packages? (y/N) "
-  read answer
-  if [ "$answer" = "y" ]; then
-  # Build all source packages.
-    exec <"$packages"
-    while read pkgname pkgpath; do
-      do_package $pkgname $pkgpath
-    done
-  fi
-fi
-# Unset trap
-trap - EXIT
+# Move the source package to the destination
+for file_name in source_package_files:
+    shutil.move(repo_build_dest + "/" + file_name, os.environ['DEBATHENA_SOURCE_ROOT'])
